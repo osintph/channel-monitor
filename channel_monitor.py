@@ -11,23 +11,55 @@ from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage
 )
 from deep_translator import GoogleTranslator
+from langdetect import detect, LangDetectException
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-API_ID       = int(os.getenv("TELEGRAM_API_ID"))
-API_HASH     = os.getenv("TELEGRAM_API_HASH")
-PHONE        = os.getenv("TELEGRAM_PHONE")
-SESSION_NAME = "farsi_monitor"
-LIMIT        = 200
+API_ID        = int(os.getenv("TELEGRAM_API_ID"))
+API_HASH      = os.getenv("TELEGRAM_API_HASH")
+PHONE         = os.getenv("TELEGRAM_PHONE")
+SESSION_NAME  = "channel_monitor"
+LIMIT         = 200
+
+OUTPUT_DIR    = Path("output")
 # ───────────────────────────────────────────────────────────────────────────────
 
-translator = GoogleTranslator(source="fa", target="en")
+# ─── LANGUAGE CONFIG ───────────────────────────────────────────────────────────
+SUPPORTED_LANGUAGES = {
+    "fa": {"name": "Farsi",              "flag": "🇮🇷"},
+    "ru": {"name": "Russian",            "flag": "🇷🇺"},
+    "zh-cn": {"name": "Chinese (Simplified)",  "flag": "🇨🇳"},
+    "zh-tw": {"name": "Chinese (Traditional)", "flag": "🇹🇼"},
+    "ko": {"name": "Korean",             "flag": "🇰🇵"},
+    "ar": {"name": "Arabic",             "flag": "🇸🇦"},
+    "uk": {"name": "Ukrainian",          "flag": "🇺🇦"},
+    "de": {"name": "German",             "flag": "🇩🇪"},
+    "fr": {"name": "French",             "flag": "🇫🇷"},
+    "es": {"name": "Spanish",            "flag": "🇪🇸"},
+    "en": {"name": "English",            "flag": "🇬🇧"},
+}
+
+LANG_DISPLAY = {
+    "fa": "🇮🇷 Farsi",
+    "ru": "🇷🇺 Russian",
+    "zh-cn": "🇨🇳 Chinese (Simplified)",
+    "zh-tw": "🇹🇼 Chinese (Traditional)",
+    "ko": "🇰🇵 Korean",
+    "ar": "🇸🇦 Arabic",
+    "uk": "🇺🇦 Ukrainian",
+    "de": "🇩🇪 German",
+    "fr": "🇫🇷 French",
+    "es": "🇪🇸 Spanish",
+    "en": "🇬🇧 English",
+}
+
+# RTL languages
+RTL_LANGUAGES = {"fa", "ar", "he", "ur"}
 
 
 # ─── DISK SPACE ────────────────────────────────────────────────────────────────
 def check_disk_space(min_gb: float, path: str = "/") -> None:
-    """Check disk space at startup and abort if below threshold."""
     total, used, free = shutil.disk_usage(path)
     free_gb  = free  / (1024 ** 3)
     total_gb = total / (1024 ** 3)
@@ -35,15 +67,13 @@ def check_disk_space(min_gb: float, path: str = "/") -> None:
     print(f"[i] Disk space — Free: {free_gb:.2f} GB / Total: {total_gb:.2f} GB ({used_pct:.1f}% used)")
     if free_gb < min_gb:
         print(f"\n[✗] ABORT: Less than {min_gb} GB free ({free_gb:.2f} GB remaining).")
-        print(f"[✗] Free up space before running again.")
         exit(1)
 
 
 def assert_disk_space(min_gb: float, path: str = "/") -> bool:
-    """Returns False if disk space is critically low — called before each download."""
     free = shutil.disk_usage(path).free / (1024 ** 3)
     if free < min_gb:
-        print(f"\n[✗] CRITICAL: Disk space dropped below {min_gb} GB ({free:.2f} GB free). Stopping downloads.")
+        print(f"\n[✗] CRITICAL: Disk space dropped below {min_gb} GB ({free:.2f} GB free). Stopping.")
         return False
     return True
 
@@ -51,7 +81,7 @@ def assert_disk_space(min_gb: float, path: str = "/") -> bool:
 # ─── CLI ARGS ──────────────────────────────────────────────────────────────────
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Farsi Telegram Channel Monitor — downloads and translates messages to English",
+        description="Telegram Channel Monitor — multi-language auto-translation to English",
         formatter_class=argparse.RawTextHelpFormatter
     )
     group = parser.add_mutually_exclusive_group(required=True)
@@ -61,19 +91,22 @@ def parse_args():
     )
     group.add_argument(
         "-f", "--file",
-        help="Path to a text file with one channel per line\nExample: --file channels.txt"
+        help="Path to channels file (one per line)\nFormat: channel::lang_code or just channel\nExample: --file channels.txt"
     )
     parser.add_argument(
         "-l", "--limit",
-        type=int,
-        default=LIMIT,
-        help=f"Number of messages to fetch per channel (default: {LIMIT}, use 0 for all)"
+        type=int, default=LIMIT,
+        help=f"Messages to fetch per channel (default: {LIMIT}, 0 = all)"
     )
     parser.add_argument(
         "-d", "--days",
-        type=int,
-        default=None,
-        help="Only fetch messages from the last N days\nExample: --days 7"
+        type=int, default=None,
+        help="Only fetch messages from last N days\nExample: --days 7"
+    )
+    parser.add_argument(
+        "--lang",
+        type=str, default=None,
+        help="Force source language code (skips auto-detect)\nExample: --lang ru\nSupported: fa, ru, zh-cn, zh-tw, ko, ar, uk\nDefault: auto-detect per message"
     )
     parser.add_argument(
         "-o", "--output",
@@ -82,48 +115,98 @@ def parse_args():
     )
     parser.add_argument(
         "--max-video-mb",
-        type=int,
-        default=50,
-        help="Max video size in MB to download (default: 50, use 0 to skip all videos)"
+        type=int, default=50,
+        help="Max video size in MB (default: 50, 0 = skip all)"
     )
     parser.add_argument(
         "--min-space-gb",
-        type=float,
-        default=1.0,
-        help="Minimum free disk space in GB before aborting (default: 1.0)"
+        type=float, default=1.0,
+        help="Abort if free disk space drops below this GB (default: 1.0)"
+    )
+    parser.add_argument(
+        "--skip-english",
+        action="store_true",
+        help="Skip translation if message is already detected as English"
     )
     return parser.parse_args()
 
 
 # ─── CHANNEL LOADER ────────────────────────────────────────────────────────────
 def load_channels(args) -> list:
+    """Returns list of (channel, forced_lang_or_None) tuples."""
     if args.channel:
-        return [args.channel.strip()]
-    elif args.file:
-        path = Path(args.file)
-        if not path.exists():
-            print(f"[!] File not found: {args.file}")
-            exit(1)
-        channels = []
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    channels.append(line)
-        if not channels:
-            print("[!] No channels found in file.")
-            exit(1)
-        print(f"[+] Loaded {len(channels)} channel(s) from {args.file}")
-        return channels
-    return []
+        return [(args.channel.strip(), args.lang)]
+
+    path = Path(args.file)
+    if not path.exists():
+        print(f"[!] File not found: {args.file}")
+        exit(1)
+
+    channels = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "::" in line:
+                parts = line.split("::", 1)
+                channels.append((parts[0].strip(), parts[1].strip().lower()))
+            else:
+                channels.append((line, args.lang))  # use CLI --lang or None
+
+    if not channels:
+        print("[!] No channels found in file.")
+        exit(1)
+
+    print(f"[+] Loaded {len(channels)} channel(s) from {args.file}")
+    return channels
+
+
+# ─── LANGUAGE DETECTION ────────────────────────────────────────────────────────
+def detect_language(text: str) -> str:
+    """Detect language of text, returns language code string."""
+    if not text or len(text.strip()) < 10:
+        return "unknown"
+    try:
+        detected = detect(text)
+        # Normalize Chinese variants
+        if detected in ("zh-cn", "zh-tw", "zh"):
+            # Simple heuristic: traditional chars tend to appear in zh-tw
+            return "zh-cn"
+        return detected
+    except LangDetectException:
+        return "unknown"
+
+
+def get_lang_display(lang_code: str) -> str:
+    return LANG_DISPLAY.get(lang_code, f"🌐 {lang_code.upper()}")
+
+
+def is_rtl(lang_code: str) -> bool:
+    return lang_code in RTL_LANGUAGES
 
 
 # ─── TRANSLATION ───────────────────────────────────────────────────────────────
-def translate_text(text: str) -> str:
+_translator_cache = {}
+
+def get_translator(source_lang: str) -> GoogleTranslator:
+    """Cache translator instances per language."""
+    if source_lang not in _translator_cache:
+        _translator_cache[source_lang] = GoogleTranslator(
+            source=source_lang, target="en"
+        )
+    return _translator_cache[source_lang]
+
+
+def translate_text(text: str, source_lang: str) -> str:
     if not text or not text.strip():
         return ""
+    if source_lang in ("en", "unknown"):
+        return text  # Already English or undetectable
+
     try:
-        chunk_size = 4500
+        translator  = get_translator(source_lang)
+        chunk_size  = 4500
         if len(text) <= chunk_size:
             return translator.translate(text)
         chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
@@ -191,21 +274,33 @@ def generate_html(messages, channel_title, output_path):
                 Your browser does not support video playback.
             </video>'''
         elif m["media_type"] == "video" and not m["media_path"]:
-            media_block = '<div class="media-placeholder">🎥 Video (skipped — size limit or download error)</div>'
+            media_block = '<div class="media-placeholder">🎥 Video (skipped)</div>'
         elif m["media_type"] == "webpage" and m.get("media_url"):
             media_block = f'<div class="webpage-preview"><a href="{m["media_url"]}" target="_blank">🔗 {m["media_url"]}</a></div>'
 
-        text_block = ""
+        text_block   = ""
+        lang_code    = m.get("detected_lang", "unknown")
+        lang_display = get_lang_display(lang_code)
+        text_dir     = "rtl" if is_rtl(lang_code) else "ltr"
+
         if m["formatted_html"]:
-            text_block = f'''
-            <div class="msg-text original" dir="rtl">{m["formatted_html"]}</div>
-            <div class="msg-divider">🔽 English Translation</div>
-            <div class="msg-text translated">{m["translated_en"]}</div>
-            '''
+            already_english = lang_code == "en"
+            if already_english:
+                text_block = f'''
+                <div class="lang-badge">{lang_display}</div>
+                <div class="msg-text original" dir="{text_dir}">{m["formatted_html"]}</div>
+                '''
+            else:
+                text_block = f'''
+                <div class="lang-badge">{lang_display}</div>
+                <div class="msg-text original" dir="{text_dir}">{m["formatted_html"]}</div>
+                <div class="msg-divider">🔽 English Translation</div>
+                <div class="msg-text translated">{m["translated_en"]}</div>
+                '''
         elif not m["formatted_html"] and m["media_type"]:
             text_block = '<div class="msg-text translated" style="color:#555">[No caption]</div>'
 
-        meta_views = f'👁 {m["views"]}' if m["views"] else ""
+        meta_views  = f'👁 {m["views"]}' if m["views"] else ""
         reply_badge = f'<span class="reply-badge">↩ Reply to #{m["reply_to"]}</span>' if m["reply_to"] else ""
 
         html_messages.append(f'''
@@ -226,7 +321,7 @@ def generate_html(messages, channel_title, output_path):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{channel_title} — Farsi → English</title>
+    <title>{channel_title} — Translated Monitor</title>
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -246,14 +341,31 @@ def generate_html(messages, channel_title, output_path):
         }}
         .msg-id {{ color: #29b6f6; font-weight: bold; }}
         .reply-badge {{ background: #1e3a5f; padding: 2px 6px; border-radius: 4px; color: #90caf9; }}
+        .lang-badge {{
+            display: inline-block; font-size: 0.72em;
+            background: #0d2137; color: #81d4fa;
+            padding: 2px 8px; border-radius: 12px;
+            margin-bottom: 6px; border: 1px solid #1a4a6e;
+        }}
         .msg-photo {{ max-width: 100%; border-radius: 8px; margin: 8px 0; display: block; }}
         .msg-video {{ max-width: 100%; border-radius: 8px; margin: 8px 0; display: block; background: #000; }}
         .msg-text {{ padding: 6px 0; line-height: 1.8; font-size: 0.97em; }}
-        .original {{ color: #ffcc80; font-size: 1.05em; border-right: 3px solid #ff8f00; padding-right: 10px; }}
+        .original {{
+            color: #ffcc80; font-size: 1.05em;
+            border-right: 3px solid #ff8f00; padding-right: 10px;
+        }}
+        .original[dir="ltr"] {{
+            border-right: none;
+            border-left: 3px solid #ff8f00;
+            padding-right: 0; padding-left: 10px;
+        }}
         .msg-divider {{ color: #444; font-size: 0.75em; margin: 6px 0; }}
         .translated {{ color: #a5d6a7; }}
         .media-placeholder {{ color: #777; font-style: italic; padding: 8px 0; }}
-        .webpage-preview {{ background: #111; padding: 8px 12px; border-radius: 6px; margin: 6px 0; border: 1px solid #2a2a2a; }}
+        .webpage-preview {{
+            background: #111; padding: 8px 12px;
+            border-radius: 6px; margin: 6px 0; border: 1px solid #2a2a2a;
+        }}
         .webpage-preview a {{ color: #29b6f6; text-decoration: none; }}
         .mention {{ color: #80cbc4; }}
         .hashtag {{ color: #ce93d8; }}
@@ -265,7 +377,7 @@ def generate_html(messages, channel_title, output_path):
 </head>
 <body>
     <h1>📡 {channel_title}</h1>
-    <p class="stats">Farsi → English &nbsp;|&nbsp; {len(messages)} messages</p>
+    <p class="stats">Auto-translated → English &nbsp;|&nbsp; {len(messages)} messages</p>
     {"".join(html_messages)}
 </body>
 </html>"""
@@ -276,11 +388,12 @@ def generate_html(messages, channel_title, output_path):
 
 # ─── CHANNEL PROCESSOR ─────────────────────────────────────────────────────────
 async def process_channel(client, channel_id, limit, output_dir,
-                           days=None, min_space_gb=1.0, max_video_mb=50):
+                           days=None, min_space_gb=1.0, max_video_mb=50,
+                           forced_lang=None, skip_english=False):
     try:
         channel = await client.get_entity(channel_id)
     except Exception as e:
-        print(f"[!] Could not access channel '{channel_id}': {e}")
+        print(f"[!] Could not access '{channel_id}': {e}")
         return
 
     channel_title = getattr(channel, "title", str(channel_id))
@@ -294,31 +407,33 @@ async def process_channel(client, channel_id, limit, output_dir,
     cutoff_date = None
     if days:
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
-        print(f"[i] Fetching messages since: {cutoff_date.strftime('%Y-%m-%d %H:%M UTC')} ({days} days back)")
+        print(f"[i] Fetching since: {cutoff_date.strftime('%Y-%m-%d %H:%M UTC')} ({days} days back)")
 
-    print(f"\n[+] Processing: {channel_title} ({channel_id})")
+    lang_mode = f"forced={forced_lang}" if forced_lang else "auto-detect"
+    print(f"\n[+] Processing: {channel_title} | lang: {lang_mode}")
 
-    results = []
+    results     = []
     fetch_limit = None if limit == 0 else limit
+    lang_stats  = {}
 
     async for message in client.iter_messages(channel, limit=fetch_limit):
 
-        # Date cutoff
         if cutoff_date and message.date < cutoff_date:
-            print(f"  [i] Reached messages older than {days} days. Stopping.")
+            print(f"  [i] Reached cutoff date. Stopping.")
             break
 
-        # Disk space check per message
         if not assert_disk_space(min_space_gb, str(output_dir)):
-            print(f"  [i] Partial results saved up to message #{message.id}")
+            print(f"  [i] Partial results saved up to #{message.id}")
             break
 
         entry = {
             "id":             message.id,
             "date":           message.date.strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "original_fa":    message.text or "",
+            "original":       message.text or "",
             "translated_en":  "",
             "formatted_html": "",
+            "detected_lang":  "unknown",
+            "forced_lang":    forced_lang,
             "media_type":     None,
             "media_path":     None,
             "media_url":      None,
@@ -328,9 +443,25 @@ async def process_channel(client, channel_id, limit, output_dir,
         }
 
         if message.text:
-            entry["translated_en"]  = translate_text(message.text)
+            # Detect or use forced language
+            if forced_lang:
+                lang = forced_lang
+            else:
+                lang = detect_language(message.text)
+
+            entry["detected_lang"]  = lang
             entry["formatted_html"] = format_entities(message.text, message.entities)
 
+            # Track language stats
+            lang_stats[lang] = lang_stats.get(lang, 0) + 1
+
+            # Translate if not already English
+            if skip_english and lang == "en":
+                entry["translated_en"] = message.text
+            else:
+                entry["translated_en"] = translate_text(message.text, lang)
+
+        # ── MEDIA ──────────────────────────────────────────────────────────────
         if message.media:
             if isinstance(message.media, MessageMediaPhoto):
                 entry["media_type"] = "photo"
@@ -355,7 +486,6 @@ async def process_channel(client, channel_id, limit, output_dir,
                             filename = media_dir / f"{message.id}.{ext}"
                             await client.download_media(message, file=str(filename))
                             entry["media_path"] = f"media/{message.id}.{ext}"
-                            print(f"  [+] Image: {filename.name}")
                         except Exception as e:
                             print(f"  [!] Image error: {e}")
 
@@ -368,11 +498,11 @@ async def process_channel(client, channel_id, limit, output_dir,
                     if max_video_mb == 0:
                         print(f"  [i] Video skipped (--max-video-mb 0)")
                     elif file_size_mb > max_video_mb:
-                        print(f"  [!] Video skipped — {file_size_mb:.1f} MB exceeds limit of {max_video_mb} MB")
+                        print(f"  [!] Video skipped — {file_size_mb:.1f} MB > limit {max_video_mb} MB")
                     elif assert_disk_space(min_space_gb, str(output_dir)):
                         try:
                             filename = media_dir / f"{message.id}.{ext}"
-                            print(f"  [~] Downloading video ({file_size_mb:.1f} MB): {filename.name} ...")
+                            print(f"  [~] Video ({file_size_mb:.1f} MB): {filename.name} ...")
                             await client.download_media(message, file=str(filename))
                             entry["media_path"] = f"media/{message.id}.{ext}"
                             print(f"  [+] Video saved: {filename.name}")
@@ -387,9 +517,10 @@ async def process_channel(client, channel_id, limit, output_dir,
                 entry["media_url"]  = getattr(wp, "url", None)
 
         results.append(entry)
-        print(f"  [MSG {message.id}] {entry['date']} | {entry['media_type'] or 'text'}")
+        lang_label = get_lang_display(entry["detected_lang"])
+        print(f"  [MSG {message.id}] {entry['date']} | {lang_label} | {entry['media_type'] or 'text'}")
 
-    # Save outputs
+    # ── SAVE OUTPUTS ───────────────────────────────────────────────────────────
     json_path = channel_dir / "messages.json"
     html_path = channel_dir / "messages.html"
 
@@ -398,7 +529,12 @@ async def process_channel(client, channel_id, limit, output_dir,
 
     generate_html(results, channel_title, html_path)
 
-    print(f"  [✓] {len(results)} messages saved → {channel_dir}/")
+    # Language breakdown summary
+    print(f"\n  [✓] {len(results)} messages saved → {channel_dir}/")
+    if lang_stats:
+        print(f"  [i] Language breakdown:")
+        for lang, count in sorted(lang_stats.items(), key=lambda x: -x[1]):
+            print(f"       {get_lang_display(lang):<30} {count} messages")
     print(f"  [✓] Open: firefox {html_path}")
 
 
@@ -415,7 +551,7 @@ async def main():
     await client.start(phone=PHONE)
     print(f"[+] Connected as {(await client.get_me()).username}")
 
-    for channel_id in channels:
+    for channel_id, forced_lang in channels:
         await process_channel(
             client,
             channel_id,
@@ -424,6 +560,8 @@ async def main():
             days         = args.days,
             min_space_gb = args.min_space_gb,
             max_video_mb = args.max_video_mb,
+            forced_lang  = forced_lang,
+            skip_english = args.skip_english,
         )
 
     await client.disconnect()
