@@ -1,22 +1,28 @@
-# 📡 Farsi Telegram Channel Monitor
+# 📡 Telegram Channel Monitor
 
-An OSINT tool that downloads messages, photos, and videos from Telegram channels and automatically translates them from **Farsi (Persian) → English**, generating a styled HTML report and structured JSON output.
+A multi-language OSINT tool that downloads messages, photos, and videos from Telegram channels and automatically translates them into **English**, generating a styled HTML report and structured JSON output per channel.
 
-Built for monitoring Farsi-language Telegram channels during the Iran conflict for intelligence and research purposes.
+Supports **Farsi, Russian, Chinese, Korean, Arabic, Ukrainian** and any other language via automatic detection. Built for monitoring foreign-language Telegram channels for intelligence and research purposes.
 
 ---
 
 ## Features
 
+- Auto-detects message language per message using `langdetect`
+- Translates any language → English via Google Translate
+- Force a specific language per channel via `channels.txt` or `--lang` flag
 - Downloads messages, photos, and videos from any Telegram channel
-- Translates Farsi text to English via Google Translate
 - Preserves message formatting (bold, italic, links, mentions, hashtags)
-- Generates a dark-themed HTML report with embedded media
-- Saves structured JSON output for further processing
-- Multi-channel support via a channels list file
-- Filter messages by number of days back
+- RTL language support (Farsi, Arabic, etc.) rendered correctly in HTML
+- Language flag badge per message in HTML output (🇮🇷 🇷🇺 🇨🇳 🇰🇵)
+- Language breakdown summary per channel after each run
+- Dark-themed HTML report with embedded media
+- Structured JSON output for further processing or platform integration
+- Multi-channel support via `channels.txt` with per-channel language tags
+- Filter messages by number of days back (`--days`)
 - Disk space guard — aborts if storage runs low
 - Video size limit to prevent runaway downloads
+- Skip English messages (`--skip-english`) to avoid unnecessary translation
 - Secure credential management via `.env` file
 
 ---
@@ -32,8 +38,8 @@ Built for monitoring Farsi-language Telegram channels during the Iran conflict f
 
 ```bash
 # Clone the repo
-git clone https://github.com/osintph/farsimonitor.git
-cd farsimonitor
+git clone https://github.com/osintph/channel-monitor.git
+cd channel-monitor
 
 # Create and activate virtual environment
 python3 -m venv venv
@@ -76,20 +82,26 @@ TELEGRAM_PHONE=+your_phone_number
 ```bash
 source venv/bin/activate
 
-# Single channel
-python farsi_monitor.py --channel irna_1931
+# Single channel — auto-detect language
+python channel_monitor.py --channel irna_1931
 
-# Single channel, last 7 days only
-python farsi_monitor.py --channel irna_1931 --days 7
+# Single channel — force language
+python channel_monitor.py --channel rt_russian --lang ru
 
-# Multiple channels from file
-python farsi_monitor.py --file channels.txt
+# Last 7 days only
+python channel_monitor.py --channel irna_1931 --days 7
+
+# Multiple channels from file (with per-channel language tags)
+python channel_monitor.py --file channels.txt
 
 # Last 30 days, skip videos over 25MB, abort if under 2GB free
-python farsi_monitor.py --file channels.txt --days 30 --max-video-mb 25 --min-space-gb 2
+python channel_monitor.py --file channels.txt --days 30 --max-video-mb 25 --min-space-gb 2
 
-# Fetch all messages, no videos, custom output dir
-python farsi_monitor.py --channel irna_1931 --limit 0 --max-video-mb 0 --output ~/reports
+# All messages, no videos, skip English messages
+python channel_monitor.py --channel some_channel --limit 0 --max-video-mb 0 --skip-english
+
+# Custom output directory
+python channel_monitor.py --file channels.txt --output ~/reports
 ```
 
 ---
@@ -102,22 +114,45 @@ python farsi_monitor.py --channel irna_1931 --limit 0 --max-video-mb 0 --output 
 | `-f`, `--file` | — | Text file with one channel per line |
 | `-l`, `--limit` | 200 | Messages to fetch per channel (0 = all) |
 | `-d`, `--days` | None | Only fetch messages from last N days |
+| `--lang` | auto | Force source language code (e.g. `ru`, `fa`, `zh-cn`, `ko`) |
+| `--skip-english` | off | Skip translation for messages detected as English |
 | `-o`, `--output` | output/ | Output directory |
 | `--max-video-mb` | 50 | Max video size in MB (0 = skip all videos) |
 | `--min-space-gb` | 1.0 | Abort if free disk space drops below this |
 
 ---
 
-## channels.txt Format
+## Supported Languages
+
+| Language | Code | Flag |
+|----------|------|------|
+| Farsi/Persian | `fa` | 🇮🇷 |
+| Russian | `ru` | 🇷🇺 |
+| Chinese (Simplified) | `zh-cn` | 🇨🇳 |
+| Chinese (Traditional) | `zh-tw` | 🇹🇼 |
+| Korean | `ko` | 🇰🇵 |
+| Arabic | `ar` | 🇸🇦 |
+| Ukrainian | `uk` | 🇺🇦 |
+| German | `de` | 🇩🇪 |
+| French | `fr` | 🇫🇷 |
+| Spanish | `es` | 🇪🇸 |
+| Auto-detect | `auto` | 🌐 |
+
+---
+
+## `channels.txt` Format
 
 ```txt
-# Iranian state media
-irna_1931
-tasnimnews
-mehrnews_agency
+# format: channel_username::language_code
+# language tag is optional — omit for auto-detect
 
-# Add invite links directly
-https://t.me/example_invite
+irna_1931::fa
+rt_russian::ru
+xinhua_news::zh-cn
+rodong_official::ko
+
+# No language tag = auto-detect
+some_unknown_channel
 ```
 
 Lines starting with `#` are ignored.
@@ -160,5 +195,5 @@ MIT License — free to use, modify, and distribute for research purposes.
 
 ---
 
-*Built by [Sigmund](https://cybernewsph.com) for OSINT monitoring of Farsi Telegram channels.*
+*Built by [Sigmund](https://cybernewsph.com) for OSINT monitoring of foreign-language Telegram channels.*
 
